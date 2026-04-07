@@ -48,7 +48,10 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_NVSHMEM')
         nvcc_flags.append('-DDISABLE_NVSHMEM')
     else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
+        # internode.cu uses TMA and requires SM90; internode_ll.cu has SM80 fallback paths
+        if not int(os.getenv('DISABLE_SM90_FEATURES', 0)):
+            sources.append('csrc/kernels/internode.cu')
+        sources.append('csrc/kernels/internode_ll.cu')
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
@@ -62,8 +65,10 @@ if __name__ == '__main__':
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
 
-        # Disable internode and low-latency kernels
-        assert disable_nvshmem
+        # When NVSHMEM is available, still compile internode_ll.cu for SM80 low-latency support (BF16-only, no TMA)
+        # NVSHMEM device linking flags are needed regardless of SM90
+        if not disable_nvshmem:
+            nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
     else:
         # Prefer H800 series
         os.environ['TORCH_CUDA_ARCH_LIST'] = os.getenv('TORCH_CUDA_ARCH_LIST', '9.0')

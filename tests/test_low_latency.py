@@ -84,9 +84,10 @@ def test_main(num_tokens: int,
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
+    sm90 = deep_ep.Buffer.is_sm90_compiled()
     for current_x in x_list:
         for return_recv_hook in (False, True):
-            for dispatch_use_fp8 in (False, True):
+            for dispatch_use_fp8 in ((False, True) if sm90 else (False, )):
                 for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
                         if shrink_test and simulate_failure_and_skip(rank, "dispatch", expected_masked_ranks):
@@ -149,7 +150,7 @@ def test_main(num_tokens: int,
                         # Check combine correctness
                         if shrink_test and simulate_failure_and_skip(rank, "combine", expected_masked_ranks):
                             break
-                        for zero_copy in (False, ) if use_logfmt else (False, True):
+                        for zero_copy in (False, ) if use_logfmt else ((False, True) if sm90 else (False, )):
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                             out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -202,7 +203,7 @@ def test_main(num_tokens: int,
         recv_x, recv_count, handle, event, hook = \
             buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                                        use_fp8=True, async_finish=False, return_recv_hook=return_recv_hook)
+                                        use_fp8=sm90, async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x,
                                                              topk_idx,

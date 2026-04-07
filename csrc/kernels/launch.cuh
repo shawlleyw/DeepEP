@@ -17,10 +17,13 @@
     cfg.attrs = attr;                                                           \
     cfg.numAttrs = 2
 #else
-#define SETUP_LAUNCH_CONFIG(sms, threads, stream) \
-    int __num_sms = (sms);                        \
-    int __num_threads = (threads);                \
-    auto __stream = (stream)
+#define SETUP_LAUNCH_CONFIG(sms, threads, stream)                                \
+    cudaLaunchConfig_t cfg = {(sms), (threads), 0, stream, nullptr, 0};         \
+    cudaLaunchAttribute attr[1];                                                \
+    attr[0].id = cudaLaunchAttributeCooperative;                                \
+    attr[0].val.cooperative = 1;                                                \
+    cfg.attrs = attr;                                                           \
+    cfg.numAttrs = 1
 #endif
 #endif
 
@@ -28,16 +31,7 @@
 #ifndef DISABLE_SM90_FEATURES
 #define LAUNCH_KERNEL(config, kernel, ...) CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
 #else
-#define LAUNCH_KERNEL(config, kernel, ...)                                                 \
-    do {                                                                                   \
-        kernel<<<__num_sms, __num_threads, 0, __stream>>>(__VA_ARGS__);                    \
-        cudaError_t e = cudaGetLastError();                                                \
-        if (e != cudaSuccess) {                                                            \
-            EPException cuda_exception("CUDA", __FILE__, __LINE__, cudaGetErrorString(e)); \
-            fprintf(stderr, "%s\n", cuda_exception.what());                                \
-            throw cuda_exception;                                                          \
-        }                                                                                  \
-    } while (0)
+#define LAUNCH_KERNEL(config, kernel, ...) CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
 #endif
 #endif
 

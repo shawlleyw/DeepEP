@@ -509,14 +509,13 @@ void dispatch(void* packed_recv_x,
     // FP8 checks
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
+#ifdef DISABLE_SM90_FEATURES
+    EP_HOST_ASSERT(not use_fp8 and "FP8 dispatch is not supported on SM80 (requires SM90 features)");
+#endif
 
 #define DISPATCH_LAUNCH_CASE(hidden)                         \
     {                                                        \
         auto dispatch_func = dispatch<false, false, hidden>; \
-        if (use_fp8 and not use_ue8m0)                       \
-            dispatch_func = dispatch<true, false, hidden>;   \
-        if (use_fp8 and use_ue8m0)                           \
-            dispatch_func = dispatch<true, true, hidden>;    \
         LAUNCH_KERNEL(&cfg,                                  \
                       dispatch_func,                         \
                       packed_recv_x,                         \
@@ -802,6 +801,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
 
+#ifndef DISABLE_SM90_FEATURES
         // TMA stuffs
         constexpr int kNumTMABufferBytes = sizeof(int4) * 32 * kNumSendUnrolls;
         constexpr int kNumStages = 3;
@@ -938,6 +938,59 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
             fence_barrier_init();
         }
         __syncwarp();
+#else
+        // SM80 fallback: direct warp-copy without TMA (BF16 only, no LogFMT)
+
+        // Issue sends
+        if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
+            for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += num_warps_per_group) {
+                const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
+                const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
+                const auto rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row);
+
+                // Copy directly to local rank, or copy to buffer and issue RDMA
+                const auto src_idx = __shfl_sync(0xffffffff, __ldg(local_src_info + token_idx), 0);
+                const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
+                const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
+                    (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
+                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                int num_send_bytes = hidden * sizeof(nv_bfloat16);
+
+                if (not zero_copy or dst_p2p_ptr != 0) {
+                    const auto cpy_src_int4_ptr = zero_copy ? reinterpret_cast<const int4*>(buf_ptr) : x_int4;
+                    const auto cpy_dst_int4_ptr =
+                        dst_p2p_ptr == 0 ? reinterpret_cast<int4*>(buf_ptr) : reinterpret_cast<int4*>(dst_p2p_ptr);
+
+                    // Direct warp copy: global → global (BF16 only)
+                    UNROLLED_WARP_COPY(8, lane_id, hidden_bf16_int4, cpy_dst_int4_ptr, cpy_src_int4_ptr, ld_nc_global, st_na_global);
+                    __syncwarp();
+                }
+
+                // Issue RDMA
+                if (dst_p2p_ptr == 0)
+                    nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, num_send_bytes, dst_rank, local_expert_idx, lane_id, token_idx - offset);
+            }
+        }
+
+        // Put the finishing flag
+        EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
+        asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
+        if (sub_warp_id == 1 and lane_id == 0) {
+            while (ld_acquire_global(atomic_clean_flag) == 0)
+                ;
+            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
+            auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+            if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
+                if (dst_p2p_ptr == 0) {
+                    nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+                } else {
+                    st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
+                }
+            }
+            atomic_add_release_global(atomic_clean_flag, -1);
+        }
+        __syncwarp();
+#endif
     }
 
 // Receiving phase
@@ -986,6 +1039,7 @@ LOW_LATENCY_COMBINE_RECV:
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_DEVICE_ASSERT(num_groups > 0);
 
+#ifndef DISABLE_SM90_FEATURES
     if (group_idx < num_groups) {
         constexpr int kNumStages = 3;
         constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2;
@@ -1136,6 +1190,64 @@ LOW_LATENCY_COMBINE_RECV:
             }
         }
     }
+#else
+    // SM80 fallback: direct global memory reads + weighted accumulation (BF16 only, no LogFMT)
+    // Uses the same warp partitioning as SM90 (decode warps handle hidden-dim slices, skip TMA loader warp)
+    if (group_idx < num_groups and decode_warp_idx < num_decode_warps) {
+        constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
+
+        int topk_idx_by_lane = 0;
+        float topk_weights_by_lane;
+        for (int token_idx = sm_id + num_sms * group_idx; token_idx < num_combined_tokens; token_idx += num_sms * num_groups) {
+            if (lane_id < num_topk) {
+                topk_idx_by_lane = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + lane_id));
+                topk_weights_by_lane = __ldg(topk_weights + token_idx * num_topk + lane_id);
+            }
+            __syncwarp();
+
+            float combined_values[kNumElemsPerInt4 * kNumRecvUnrolls] = {0.0f};
+            for (int i = 0; i < num_topk; ++i) {
+                int topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i);
+                if (topk_idx_reg < 0)
+                    continue;
+                if (is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts))
+                    continue;
+                const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
+
+                // Read directly from global memory for this expert's data
+                // Slot format: [BF16 data (hidden * 2 bytes)] [metadata (kNumMetaBytes)]
+                // For non-LogFMT BF16, data is written starting from slot base by the send phase
+                auto recv_buffer = static_cast<uint8_t*>(rdma_recv_x) +
+                    (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot;
+                auto recv_data = reinterpret_cast<uint32_t*>(recv_buffer + kNumBF16PerWarpBytes * decode_warp_idx +
+                                                             kNumBF16PerWarpBytes / 32 * lane_id);
+
+                // Weighted accumulation directly from global memory
+                #pragma unroll
+                for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
+                    auto bf16_pack = *reinterpret_cast<__nv_bfloat162*>(recv_data + k);
+                    combined_values[k * 2 + 0] += static_cast<float>(bf16_pack.x) * topk_weight;
+                    combined_values[k * 2 + 1] += static_cast<float>(bf16_pack.y) * topk_weight;
+                }
+            }
+
+            // Write combined result directly to output
+            auto out_int4 = static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 +
+                            decode_warp_idx * kNumRecvUnrolls * 32 + lane_id * kNumRecvUnrolls;
+            #pragma unroll
+            for (int k = 0; k < kNumRecvUnrolls; ++k) {
+                int4 out_val;
+                auto out_bf16 = reinterpret_cast<nv_bfloat16*>(&out_val);
+                #pragma unroll
+                for (int j = 0; j < kNumElemsPerInt4; ++j) {
+                    out_bf16[j] = __float2bfloat16(combined_values[k * kNumElemsPerInt4 + j]);
+                }
+                out_int4[k] = out_val;
+            }
+            __syncwarp();
+        }
+    }
+#endif
 }
 
 void combine(void* combined_x,
@@ -1181,6 +1293,9 @@ void combine(void* combined_x,
 
     // Online cast cannot use zero-copy
     EP_HOST_ASSERT(not(zero_copy and use_logfmt));
+#ifdef DISABLE_SM90_FEATURES
+    EP_HOST_ASSERT(not use_logfmt and "LogFMT combine is not supported on SM80 (requires SM90 features)");
+#endif
 
     constexpr int kNumStages = 3;
     constexpr int kNumMaxUnrolls = 4;
@@ -1196,14 +1311,14 @@ void combine(void* combined_x,
     const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3);
 
     // Total requirement
+#ifndef DISABLE_SM90_FEATURES
     const int smem_size = max(smem_send_size, smem_recv_size);
+#else
+    // SM80: no shared memory needed (direct global memory access)
+    const int smem_size = 0;
+#endif
 
-#define COMBINE_LAUNCH_CASE(hidden)                                                                                                \
-    {                                                                                                                              \
-        auto combine_func =                                                                                                        \
-            use_logfmt ? combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
-        SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                   \
-        LAUNCH_KERNEL(&cfg,                                                                                                        \
+#define COMBINE_LAUNCH_ARGS                                                                                                        \
                       combine_func,                                                                                                \
                       combined_x,                                                                                                  \
                       rdma_recv_x,                                                                                                 \
@@ -1229,13 +1344,30 @@ void combine(void* combined_x,
                       num_warp_groups,                                                                                             \
                       num_warps_per_group,                                                                                         \
                       phases,                                                                                                      \
-                      zero_copy);                                                                                                  \
+                      zero_copy
+
+#ifndef DISABLE_SM90_FEATURES
+#define COMBINE_LAUNCH_CASE(hidden)                                                                                                \
+    {                                                                                                                              \
+        auto combine_func =                                                                                                        \
+            use_logfmt ? combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+        SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                   \
+        LAUNCH_KERNEL(&cfg, COMBINE_LAUNCH_ARGS);                                                                                  \
     }                                                                                                                              \
     break
+#else
+#define COMBINE_LAUNCH_CASE(hidden)                                                                                                \
+    {                                                                                                                              \
+        auto combine_func = combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>;                                                   \
+        LAUNCH_KERNEL(&cfg, COMBINE_LAUNCH_ARGS);                                                                                  \
+    }                                                                                                                              \
+    break
+#endif
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
+#undef COMBINE_LAUNCH_ARGS
 }
 
 template <int kNumThreads>

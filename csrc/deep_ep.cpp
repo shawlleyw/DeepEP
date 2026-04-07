@@ -943,9 +943,9 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            int num_worst_tokens,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
-                           bool async,
+                            bool async,
                            bool allocate_on_comm_stream) {
-#ifndef DISABLE_NVSHMEM
+#if !defined(DISABLE_NVSHMEM) && !defined(DISABLE_SM90_FEATURES)
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
     // unless we release GIL here.
@@ -1302,7 +1302,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             send_nvl_head,
             event};
 #else
-    EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
+    EP_HOST_ASSERT(false and "NVSHMEM or internode features disabled during compilation");
     return {};
 #endif
 }
@@ -1323,7 +1323,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     std::optional<EventHandle>& previous_event,
     bool async,
     bool allocate_on_comm_stream) {
-#ifndef DISABLE_NVSHMEM
+#if !defined(DISABLE_NVSHMEM) && !defined(DISABLE_SM90_FEATURES)
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
 
@@ -1544,6 +1544,9 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
+#ifdef DISABLE_SM90_FEATURES
+    EP_HOST_ASSERT(not use_fp8 and "FP8 low-latency dispatch requires SM90 features");
+#endif
 
     // Tensor checks
     // By default using `ptp128c` FP8 cast
@@ -1687,6 +1690,9 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     const std::optional<torch::Tensor>& out) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
+#ifdef DISABLE_SM90_FEATURES
+    EP_HOST_ASSERT(not use_logfmt and "LogFMT low-latency combine requires SM90 features");
+#endif
 
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1823,22 +1829,34 @@ bool is_sm90_compiled() {
 }
 
 void Buffer::low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
+#ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < num_ranks);
     internode_ll::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
+#else
+    EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
+#endif
 }
 
 void Buffer::low_latency_query_mask_buffer(const torch::Tensor& mask_status) {
+#ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(mask_status.numel() == num_ranks && mask_status.scalar_type() == torch::kInt32);
 
     internode_ll::query_mask_buffer(
         mask_buffer_ptr, num_ranks, reinterpret_cast<int*>(mask_status.data_ptr()), at::cuda::getCurrentCUDAStream());
+#else
+    EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
+#endif
 }
 
 void Buffer::low_latency_clean_mask_buffer() {
+#ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
+#else
+    EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
+#endif
 }
 
 }  // namespace deep_ep

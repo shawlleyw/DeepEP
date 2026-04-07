@@ -61,9 +61,12 @@
 // Ampere does not support FP8 features
 #define __NV_E4M3 0
 #define __NV_E5M2 1
+#define __NV_SATFINITE 0
 typedef int __nv_fp8_interpretation_t;
 typedef int __nv_fp8x4_e4m3;
 typedef uint8_t __nv_fp8_storage_t;
+typedef uint16_t __nv_fp8x2_storage_t;
+__device__ __forceinline__ __nv_fp8x2_storage_t __nv_cvt_float2_to_fp8x2(float2, int, int) { return 0; }
 #endif
 
 namespace deep_ep {

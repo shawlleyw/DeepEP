@@ -414,6 +414,11 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
 
+#else
+// SM80 stubs for TMA functions (referenced by templates that are compiled but not executed on SM80)
+__device__ __forceinline__ void tma_store_fence() {}
+template <int N>
+__device__ __forceinline__ void tma_store_wait() {}
 #endif
 
 template <typename dtype_t>
