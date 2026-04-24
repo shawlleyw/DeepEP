@@ -111,8 +111,10 @@
             case_macro(2048);                               \
         case 2560:                                          \
             case_macro(2560);                               \
+        case 2880:                                          \
+            case_macro(2880); /* gpt-oss-120b, SM80 only */ \
         case 3072:                                          \
-            case_macro(3072); /* for gpt-oss */             \
+            case_macro(3072);                               \
         case 4096:                                          \
             case_macro(4096);                               \
         case 5120:                                          \

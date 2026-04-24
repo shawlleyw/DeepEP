@@ -325,7 +325,15 @@ if __name__ == '__main__':
     parser.add_argument('--use-logfmt', action='store_true', help='Whether to test LogFMT combine')
     parser.add_argument("--pressure-test", action='store_true', help='Whether to do pressure test')
     parser.add_argument("--shrink-test", action='store_true', help='Whether to simulate failure and test shrink mode')
+    parser.add_argument('--gpt-oss', action='store_true',
+                        help='Use gpt-oss-120b config (hidden=2880, num_experts=128, num_topk=4)')
     args = parser.parse_args()
+
+    if args.gpt_oss:
+        # gpt-oss-120b: hidden_size=2880, num_local_experts=128, experts_per_token=4
+        args.hidden = 2880
+        args.num_experts = 128
+        args.num_topk = 4
 
     num_processes = args.num_processes
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)

@@ -305,7 +305,15 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=256, help='Number of experts (default: 256)')
     parser.add_argument('--allow-mnnvl', action="store_true", help='Enable MNNVL support')
     parser.add_argument('--use-fabric', action="store_true", help='Enable fabric mode')
+    parser.add_argument('--gpt-oss', action='store_true',
+                        help='Use gpt-oss-120b config (hidden=2880, num_experts=128, num_topk=4)')
     args = parser.parse_args()
+
+    if args.gpt_oss:
+        # gpt-oss-120b: hidden_size=2880, num_local_experts=128, experts_per_token=4
+        args.hidden = 2880
+        args.num_experts = 128
+        args.num_topk = 4
 
     num_processes = args.num_processes
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)

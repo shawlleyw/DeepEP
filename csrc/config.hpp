@@ -136,7 +136,9 @@ struct LowLatencyLayout {
     }
 
     LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
-        const int num_scales = hidden / 128;
+        // Use ceil-div so that non-128-divisible hidden (e.g. gpt-oss 2880) still allocates
+        // enough metadata slots for the LogFMT amax/amin pair per 128-channel division.
+        const int num_scales = (hidden + 127) / 128;
 
         // Dispatch and combine layout:
         //  - 2 symmetric odd/even send buffer
@@ -147,8 +149,11 @@ struct LowLatencyLayout {
         // NOTES: you should add a control `int4` for combine messages if you want to do data transformation
         // NOTES: `num_scales * sizeof(nv_bfloat162)` means the per-128-channel min/max
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
-        size_t num_bytes_per_dispatch_msg = sizeof(int4) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
-        size_t num_bytes_per_combine_msg = num_scales * sizeof(nv_bfloat162) + hidden * sizeof(nv_bfloat16);
+        // Combine slot is `[BF16 data][metadata]`; pad metadata so the slot is int4-aligned for any hidden.
+        const size_t combine_meta_bytes = align_up<size_t>(num_scales * sizeof(nv_bfloat162), sizeof(int4));
+        size_t num_bytes_per_dispatch_msg =
+            sizeof(int4) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
+        size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16) + combine_meta_bytes;
 
         // Send buffer
         size_t dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;

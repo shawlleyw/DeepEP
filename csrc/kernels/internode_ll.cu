@@ -195,7 +195,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     // 2. The last warp for reading `topk_idx` and count for per-expert information
     if (warp_id < num_warps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
-        EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
+        EP_STATIC_ASSERT(kHidden % kNumElemsPerRead == 0, "Hidden must be int4-aligned");
+        // FP8 path uses warp-wide amax reduction over full 256-element strides; BF16 only needs int4 alignment.
+        EP_STATIC_ASSERT(not kUseFP8 or kHidden % (32 * kNumElemsPerRead) == 0, "FP8 dispatch requires kHidden % 256 == 0");
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
         const auto num_threads = (num_warps - 1) * 32;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
@@ -210,8 +212,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
-            // FP8 cast
-            EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
+            // FP8 cast (BF16 path tolerates a partial-warp tail iteration)
+            EP_STATIC_ASSERT(not kUseFP8 or hidden_bf16_int4 % 32 == 0, "FP8 dispatch must use the full warp to reduce");
             #pragma unroll
             for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
                 // Read
@@ -757,17 +759,21 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
     constexpr int kNumSendUnrolls = kHidden % (32 * 4 * sizeof(int4) / sizeof(nv_bfloat16)) == 0 ? 4 : 2;
     constexpr int kNumRecvUnrolls = 2;
     constexpr int hidden_bf16_int4_pad = align_up(static_cast<int>(hidden_bf16_int4), 32 * kNumSendUnrolls);
+#ifndef DISABLE_SM90_FEATURES
+    // The SM90 TMA send/recv pipeline assumes warp-tile-aligned hidden; SM80 path uses bounds-checked tail handling.
     EP_STATIC_ASSERT(kHidden % (32 * 2 * sizeof(int4) / sizeof(nv_bfloat16)) == 0, "Invalid hidden");
+#endif
     EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
     EP_STATIC_ASSERT(hidden_bf16_int4 % kNumSendUnrolls == 0, "Invalid hidden");
     EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
 
-    // Message package
-    EP_STATIC_ASSERT(kHidden % 128 == 0, "Invalid hidden");
-    constexpr int kNumDivisions = kHidden / 128;
-    constexpr int kNumMetaBytes = kNumDivisions * sizeof(nv_bfloat162);
+    // Message package: ceil-divide so non-128 hidden (e.g. gpt-oss 2880) gets a metadata slot per partial division;
+    // pad metadata to int4 so the slot stride stays 16-byte aligned for warp-vector copies.
+    constexpr int kNumDivisions = (kHidden + 127) / 128;
+    constexpr int kNumMetaBytes = static_cast<int>(align_up<size_t>(kNumDivisions * sizeof(nv_bfloat162), sizeof(int4)));
     constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16) + kNumMetaBytes;
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
+    EP_STATIC_ASSERT(not kUseLogFMT or kHidden % 128 == 0, "LogFMT combine requires kHidden % 128 == 0");
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -1035,7 +1041,10 @@ LOW_LATENCY_COMBINE_RECV:
     const int num_groups = min(kMaxNumGroups, (num_threads / 32) / (num_decode_warps + 1));
     const int decode_warp_idx = __shfl_sync(0xffffffff, warp_id % (num_decode_warps + 1), 0);
     const int group_idx = __shfl_sync(0xffffffff, warp_id / (num_decode_warps + 1), 0);
+#ifndef DISABLE_SM90_FEATURES
+    // SM90 TMA pipeline assumes warp-tile alignment; SM80 fallback path bounds-checks the tail warp instead.
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+#endif
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_DEVICE_ASSERT(num_groups > 0);
 
@@ -1196,6 +1205,13 @@ LOW_LATENCY_COMBINE_RECV:
     if (group_idx < num_groups and decode_warp_idx < num_decode_warps) {
         constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
 
+        // Each lane in this warp owns kNumRecvUnrolls consecutive int4 elements within the warp tile.
+        // For non-warp-tile-aligned hidden (e.g. gpt-oss 2880, hidden_bf16_int4=360, last warp covers
+        // [320,384) but real data ends at 360), bound the per-lane work so we never touch padding bytes.
+        const int lane_int4_offset = decode_warp_idx * kNumRecvUnrolls * 32 + lane_id * kNumRecvUnrolls;
+        const int lane_valid_int4 = max(0, min(static_cast<int>(kNumRecvUnrolls),
+                                               static_cast<int>(hidden_bf16_int4) - lane_int4_offset));
+
         int topk_idx_by_lane = 0;
         float topk_weights_by_lane;
         for (int token_idx = sm_id + num_sms * group_idx; token_idx < num_combined_tokens; token_idx += num_sms * num_groups) {
@@ -1214,35 +1230,34 @@ LOW_LATENCY_COMBINE_RECV:
                     continue;
                 const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
 
-                // Read directly from global memory for this expert's data
-                // Slot format: [BF16 data (hidden * 2 bytes)] [metadata (kNumMetaBytes)]
-                // For non-LogFMT BF16, data is written starting from slot base by the send phase
+                // Slot format (BF16, no LogFMT): [BF16 data (hidden * 2 bytes)] [unused metadata padding]
                 auto recv_buffer = static_cast<uint8_t*>(rdma_recv_x) +
                     (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot;
-                auto recv_data = reinterpret_cast<uint32_t*>(recv_buffer + kNumBF16PerWarpBytes * decode_warp_idx +
-                                                             kNumBF16PerWarpBytes / 32 * lane_id);
+                auto recv_int4 = reinterpret_cast<int4*>(recv_buffer) + lane_int4_offset;
 
-                // Weighted accumulation directly from global memory
                 #pragma unroll
-                for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
-                    auto bf16_pack = *reinterpret_cast<__nv_bfloat162*>(recv_data + k);
-                    combined_values[k * 2 + 0] += static_cast<float>(bf16_pack.x) * topk_weight;
-                    combined_values[k * 2 + 1] += static_cast<float>(bf16_pack.y) * topk_weight;
+                for (int k = 0; k < kNumRecvUnrolls; ++k) {
+                    if (k < lane_valid_int4) {
+                        int4 v = ld_nc_global(recv_int4 + k);
+                        auto bf16 = reinterpret_cast<nv_bfloat16*>(&v);
+                        #pragma unroll
+                        for (int j = 0; j < kNumElemsPerInt4; ++j)
+                            combined_values[k * kNumElemsPerInt4 + j] += static_cast<float>(bf16[j]) * topk_weight;
+                    }
                 }
             }
 
-            // Write combined result directly to output
-            auto out_int4 = static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 +
-                            decode_warp_idx * kNumRecvUnrolls * 32 + lane_id * kNumRecvUnrolls;
+            auto out_int4 = static_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4 + lane_int4_offset;
             #pragma unroll
             for (int k = 0; k < kNumRecvUnrolls; ++k) {
-                int4 out_val;
-                auto out_bf16 = reinterpret_cast<nv_bfloat16*>(&out_val);
-                #pragma unroll
-                for (int j = 0; j < kNumElemsPerInt4; ++j) {
-                    out_bf16[j] = __float2bfloat16(combined_values[k * kNumElemsPerInt4 + j]);
+                if (k < lane_valid_int4) {
+                    int4 out_val;
+                    auto out_bf16 = reinterpret_cast<nv_bfloat16*>(&out_val);
+                    #pragma unroll
+                    for (int j = 0; j < kNumElemsPerInt4; ++j)
+                        out_bf16[j] = __float2bfloat16(combined_values[k * kNumElemsPerInt4 + j]);
+                    out_int4[k] = out_val;
                 }
-                out_int4[k] = out_val;
             }
             __syncwarp();
         }
