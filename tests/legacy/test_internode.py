@@ -172,8 +172,8 @@ def test_main(args: argparse.Namespace,
                                 dim=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.eq(-1)]
                             check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
 
-                    # Test `num_worst_tokens != 0`
-                    if with_topk:
+                    # Test `num_worst_tokens != 0` (intranode-only; internode dispatch does not support it)
+                    if with_topk and num_nodes == 1:
                         num_worst_tokens = num_tokens * num_ranks
                         dispatch_args.update({'num_worst_tokens': num_worst_tokens})
                         recv_worst_x, recv_worst_topk_idx, recv_worst_topk_weights, empty_list, _, event = buffer.dispatch(**dispatch_args)
