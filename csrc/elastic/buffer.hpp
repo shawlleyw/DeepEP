@@ -90,7 +90,10 @@ public:
         num_buffer_bytes(num_buffer_bytes),
         num_cpu_buffer_bytes(num_cpu_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
-        comm_stream(get_global_comm_stream()),
+        // Keep communication independent across ElasticBuffer instances.  A
+        // process-global stream serializes otherwise independent communicators
+        // (for example, two modality-specific EP buffers).
+        comm_stream(at::cuda::getStreamFromPool(true)),
         allow_hybrid_mode(allow_hybrid_mode),
         allow_multiple_reduction(allow_multiple_reduction),
         prefer_overlap_with_compute(prefer_overlap_with_compute) {

@@ -5,13 +5,6 @@
 
 namespace deep_ep::elastic {
 
-static at::cuda::CUDAStream get_global_comm_stream() {
-    static std::optional<at::cuda::CUDAStream> comm_stream = std::nullopt;
-    if (not comm_stream.has_value())
-        comm_stream = at::cuda::getStreamFromPool(true);
-    return comm_stream.value();
-}
-
 template <int kNumDims>
 static auto get_shape(const torch::Tensor& t) {
     EP_HOST_ASSERT(t.dim() == kNumDims);
